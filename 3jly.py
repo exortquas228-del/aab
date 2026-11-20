@@ -670,15 +670,21 @@ async def send_captcha_message(
         [InlineKeyboardButton(f" {opt} ", callback_data=f"captcha_{opt}") for opt in opts_list]
     ])
 
+    # 1. Если это callback (нажатие на кнопку) — редактируем текущее сообщение капчи
     query = update.callback_query
     if query and query.message:
         try:
             await query.edit_message_text(text=text, reply_markup=kb, parse_mode="HTML")
             return
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"edit captcha failed: {e}")
+            # Если отредактировать не удалось — попробуем удалить старое и отправить новое
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
 
-    # Удаляем предыдущее сообщение капчи, если оно было
+    # 2. Удаляем предыдущее сообщение капчи, если оно было сохранено
     prev_id = context.user_data.get("captcha_msg_id")
     if prev_id:
         try:
@@ -686,6 +692,7 @@ async def send_captcha_message(
         except Exception:
             pass
 
+    # 3. Отправляем новое сообщение с капчей
     try:
         msg = await context.bot.send_message(
             chat_id=chat_id,
@@ -733,9 +740,9 @@ async def captcha_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query or not user:
         return
 
-    # ⚠️ Анти-флуд уже проверен в callback_router.
-    # НЕ дублируем check_anti_flood здесь — иначе из-за миллисекундной задержки
-    # второй вызов сразу вернёт False и обработка капчи зависнет.
+    # ⚠️ check_anti_flood уже вызван в callback_router.
+    # НЕ дублируем его здесь — иначе из-за миллисекундной задержки
+    # второй вызов сразу вернёт False и капча зависнет.
 
     try:
         ans = query.data.split("_")[1]
@@ -748,8 +755,17 @@ async def captcha_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     correct = context.user_data.get("captcha_correct")
 
-    if correct is not None and str(correct) == ans:
-        # ✅ Правильный ответ — гасим спиннер и показываем подтверждение
+    # Если капча в user_data потерялась (например, после рестарта бота)
+    if correct is None:
+        try:
+            await query.answer("⚠️ Капча устарела, генерирую новую...", show_alert=False)
+        except Exception:
+            pass
+        await send_captcha_message(update, context, is_wrong=True)
+        return
+
+    if str(correct) == ans:
+        # ✅ Правильный ответ — гасим спиннер с подтверждением
         try:
             await query.answer("✅ Капча успешно пройдена!", show_alert=False)
         except Exception:
@@ -761,7 +777,8 @@ async def captcha_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Удаляем текстовое сообщение капчи
         try:
-            await query.message.delete()
+            if query.message:
+                await query.message.delete()
         except Exception:
             pass
 
@@ -772,43 +789,12 @@ async def captcha_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Открываем полный функционал бота с баннером и клавиатурой
         await show_main_menu(update, context)
     else:
-        # ❌ Неверный ответ — гасим спиннер и показываем новую капчу
+        # ❌ Неверный ответ — гасим спиннер, показываем новую капчу
         try:
             await query.answer("❌ Неверно! Попробуйте еще раз.", show_alert=False)
         except Exception:
             pass
 
-        # send_captcha_message сам отредактирует текущее сообщение
-        # и покажет новый пример с текстом "❌ Неверный ответ!"
-        await send_captcha_message(update, context, is_wrong=True)
-        # Успешное прохождение капчи
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET captcha_passed = 1 WHERE tg_id = ?", (user.id,))
-            await db.commit()
-
-        try:
-            await query.answer("✅ Капча успешно пройдена!", show_alert=False)
-        except Exception:
-            pass
-
-        # Удаляем текстовое сообщение капчи
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
-
-        context.user_data.pop("captcha_msg_id", None)
-        context.user_data["menu_msg_id"] = None
-        context.user_data["current_photo"] = None
-
-        # Открываем полный функционал бота с баннером и клавиатурой
-        await show_main_menu(update, context)
-    else:
-        # Неверный ответ — моментальное всплывающее окно и генерация нового примера
-        try:
-            await query.answer("❌ Неверно! Попробуйте еще раз.", show_alert=True)
-        except Exception:
-            pass
         await send_captcha_message(update, context, is_wrong=True)
 
 
@@ -820,7 +806,6 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     greeting = await get_config("greeting_text", DEFAULT_GREETING)
     kb = get_main_keyboard(is_admin=is_adm)
     await render_post(update, context, banner_photo, greeting, kb)
-
 
 # ==============================================================================
 # ОБРАБОТЧИКИ: ПРОФИЛЬ И ПОПОЛНЕНИЕ КОШЕЛЬКА
