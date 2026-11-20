@@ -5,14 +5,15 @@
 """
 
 import asyncio
-import io
 import logging
 import os
 import random
 import re
+import struct
 import sys
 import time
 import uuid
+import zlib
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set
 
@@ -53,8 +54,9 @@ if os.path.isfile(_env_path):
     except Exception:
         pass
 
-# Токен основного бота
-BOT_TOKEN = os.getenv("BOT_TOKEN", "9223853959:AAGnEmmssJrArVQvygb_00_QrnME9DeRasg").strip()
+# Токен только из окружения или из файла .env рядом со скриптом.
+# В коде токен не хранится: тот, что был прописан раньше, нужно считать засвеченным.
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 # Идентификаторы администраторов (автоматический полный доступ только им)
 ADMIN_IDS: Set[int] = {8822479121, 8818045521}
@@ -102,6 +104,9 @@ logger = logging.getLogger("PharmojellyBot")
 # Защита от флуда: время последнего действия пользователя {tg_id: timestamp}
 user_last_action: Dict[int, float] = {}
 
+# Верный ответ капчи, если user_data бота сбросился: {tg_id: сумма}
+pending_captcha: Dict[int, int] = {}
+
 # Реестр запущенных приложений ботов {token: Application}
 running_applications: Dict[str, Application] = {}
 
@@ -122,6 +127,44 @@ def get_abs_path(filename: str) -> str:
     return os.path.join(BASE_DIR, filename)
 
 
+def _image_ok(path: str) -> bool:
+    """Настоящий файл картинки, а не пустышка в несколько сотен байт."""
+    try:
+        return bool(path) and os.path.isfile(path) and os.path.getsize(path) > 500
+    except OSError:
+        return False
+
+
+def _write_placeholder(path: str, width: int = 640, height: int = 360) -> str:
+    """
+    Пишет нормальный PNG (не 1x1).
+    Telegram отклоняет крошечный JPEG ошибкой PHOTO_INVALID_DIMENSIONS,
+    и после капчи меню просто не появляется.
+    """
+    def _chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    rgb = (18, 52, 86)
+    row = b"\x00" + bytes(rgb) * width
+    raw = row * height
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", ihdr)
+        + _chunk(b"IDAT", zlib.compress(raw, 9))
+        + _chunk(b"IEND", b"")
+    )
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(png)
+    return path
+
+
 def resolve_photo_path(photo_name: Optional[str]) -> str:
     """
     Разрешает путь к фото. Если файл не найден, возвращает fallback-изображение (banner.jpg).
@@ -134,6 +177,7 @@ def resolve_photo_path(photo_name: Optional[str]) -> str:
 
     candidates.extend([
         get_abs_path(FILE_BANNER_MAIN),
+        get_abs_path("banner.png"),
         get_abs_path(FILE_BANNER_ASSORT),
         get_abs_path(FILE_PHOTO_LIR),
         get_abs_path(FILE_PHOTO_WATER),
@@ -141,26 +185,15 @@ def resolve_photo_path(photo_name: Optional[str]) -> str:
     ])
 
     for p in candidates:
-        if os.path.isfile(p):
+        if _image_ok(p):
             return p
 
-    # Если файлов картинок вообще нет, создадим минимальную заглушку
-    dummy_path = get_abs_path("banner.jpg")
-    if not os.path.isfile(dummy_path):
-        try:
-            with open(dummy_path, "wb") as f:
-                # минимальный 1x1 белый JPEG
-                f.write(
-                    b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00H\x00H\x00\x00\xff\xdb\x00C\x00\x08\x06\x06"
-                    b"\x07\x06\x05\x08\x07\x07\x07\t\t\x08\n\x0c\x14\r\x0c\x0b\x0b\x0c\x19\x12\x13\x0f\x14\x1d\x1a"
-                    b"\x1f\x1e\x1d\x1a\x1c\x1c $.' \",#\x1c\x1c(7),01444\x1f'9=82<.342\xff\xc0\x00\x0b\x08\x00\x01"
-                    b"\x00\x01\x01\x01\x11\x00\xff\xc4\x00\x1f\x00\x00\x01\x05\x01\x01\x01\x01\x01\x01\x00\x00\x00"
-                    b"\x00\x00\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\xff\xda\x00\x08\x01\x01\x00\x00"
-                    b"?\x00\xbf\x00\xff\xd9"
-                )
-        except Exception:
-            pass
-    return dummy_path
+    placeholder = get_abs_path("banner.png")
+    try:
+        return _write_placeholder(placeholder)
+    except Exception:
+        logger.exception("Could not write placeholder image")
+        return placeholder
 
 
 # ==============================================================================
@@ -170,6 +203,8 @@ def resolve_photo_path(photo_name: Optional[str]) -> str:
 async def init_db():
     """Инициализация и миграция базы данных SQLite."""
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL;")
+        await db.execute("PRAGMA busy_timeout=5000;")
         # Таблица пользователей
         await db.execute(
             """
@@ -431,8 +466,8 @@ async def get_or_create_user(tg_id: int, source_bot_token: str = "") -> dict:
             "tg_id": row[0],
             "account_id": row[1],
             "balance": float(row[2]),
-            "captcha_passed": int(row[3]),
-            "bonus_claimed": int(row[4]),
+            "captcha_passed": int(row[3] or 0),
+            "bonus_claimed": int(row[4] or 0),
             "source_bot_token": row[5] or "",
         }
 
@@ -465,6 +500,7 @@ async def render_post(
     caption: str,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
     keep_state: bool = False,
+    force_new: bool = False,
 ):
     """
     Основной метод отображения интерфейса.
@@ -474,6 +510,7 @@ async def render_post(
     3. Если пользователь прислал текст/фото (ввод суммы, скриншот и т.д.), бот удаляет
        сообщение пользователя и редактирует предыдущий пост бота.
     4. Защиту от сбоев Telegram API и 'Message is not modified'.
+    5. После текстовой капчи меню уходит новым сообщением, без правки удалённого текста как фото.
     """
     resolved_path = resolve_photo_path(photo_name_or_path)
     user_id = update.effective_user.id if update.effective_user else 0
@@ -482,10 +519,14 @@ async def render_post(
     if not keep_state:
         context.user_data.pop("state", None)
 
+    if force_new:
+        context.user_data["menu_msg_id"] = None
+        context.user_data["current_photo"] = None
+
     edited = False
 
-    # 1. Если клик по кнопке (CallbackQuery)
-    if update.callback_query:
+    # 1. Если клик по кнопке (CallbackQuery) и пост уже с фото
+    if update.callback_query and not force_new:
         query = update.callback_query
         try:
             await query.answer()
@@ -493,8 +534,9 @@ async def render_post(
             pass
 
         current_photo = context.user_data.get("current_photo")
+        has_photo = bool(query.message and query.message.photo)
 
-        if query.message:
+        if query.message and has_photo:
             # Если фото то же самое — просто меняем подпись (это мгновенно и без задержки)
             if current_photo == resolved_path:
                 try:
@@ -511,7 +553,7 @@ async def render_post(
                     edited = False
 
             # Если фото изменилось или edit_caption не прошел — пробуем редактировать медиа
-            if not edited:
+            if not edited and _image_ok(resolved_path):
                 try:
                     with open(resolved_path, "rb") as f:
                         await query.edit_message_media(
@@ -519,6 +561,7 @@ async def render_post(
                             reply_markup=reply_markup,
                         )
                     context.user_data["current_photo"] = resolved_path
+                    context.user_data["menu_is_photo"] = True
                     edited = True
                 except tg_error.BadRequest as e:
                     if "Message is not modified" in str(e):
@@ -529,18 +572,18 @@ async def render_post(
 
         if edited and query.message:
             context.user_data["menu_msg_id"] = query.message.message_id
+            context.user_data["menu_is_photo"] = True
             return
 
-        # Если не удалось отредактировать сообщение (например, это было текстовое сообщение капчи или удаленное сообщение),
-        # пытаемся удалить старое сообщение query
+        # Текстовая капча или уже удалённое сообщение — не редактируем его как фото
         try:
-            if query.message:
+            if query.message and not has_photo:
                 await query.message.delete()
         except Exception:
             pass
 
     # 2. Если пользователь прислал текстовое сообщение или файл
-    elif update.message:
+    elif update.message and not force_new:
         try:
             await update.message.delete()
         except Exception:
@@ -549,14 +592,15 @@ async def render_post(
     # 3. Попытка отредактировать сохраненный menu_msg_id
     menu_msg_id = context.user_data.get("menu_msg_id")
     current_photo = context.user_data.get("current_photo")
+    menu_is_photo = context.user_data.get("menu_is_photo", True)
 
-    if menu_msg_id:
-        if current_photo == resolved_path:
+    if menu_msg_id and not force_new:
+        if not menu_is_photo:
             try:
-                await context.bot.edit_message_caption(
+                await context.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=menu_msg_id,
-                    caption=caption,
+                    text=caption,
                     reply_markup=reply_markup,
                     parse_mode="HTML",
                 )
@@ -566,39 +610,74 @@ async def render_post(
                     edited = True
             except Exception:
                 edited = False
-
-        if not edited:
-            try:
-                with open(resolved_path, "rb") as f:
-                    await context.bot.edit_message_media(
+        else:
+            if current_photo == resolved_path:
+                try:
+                    await context.bot.edit_message_caption(
                         chat_id=chat_id,
                         message_id=menu_msg_id,
-                        media=InputMediaPhoto(media=f, caption=caption, parse_mode="HTML"),
+                        caption=caption,
                         reply_markup=reply_markup,
+                        parse_mode="HTML",
                     )
-                context.user_data["current_photo"] = resolved_path
-                edited = True
-            except tg_error.BadRequest as e:
-                if "Message is not modified" in str(e):
                     edited = True
-            except Exception:
-                edited = False
+                except tg_error.BadRequest as e:
+                    if "Message is not modified" in str(e):
+                        edited = True
+                except Exception:
+                    edited = False
+
+            if not edited and _image_ok(resolved_path):
+                try:
+                    with open(resolved_path, "rb") as f:
+                        await context.bot.edit_message_media(
+                            chat_id=chat_id,
+                            message_id=menu_msg_id,
+                            media=InputMediaPhoto(media=f, caption=caption, parse_mode="HTML"),
+                            reply_markup=reply_markup,
+                        )
+                    context.user_data["current_photo"] = resolved_path
+                    context.user_data["menu_is_photo"] = True
+                    edited = True
+                except tg_error.BadRequest as e:
+                    if "Message is not modified" in str(e):
+                        edited = True
+                except Exception:
+                    edited = False
 
     # 4. Если отредактировать не удалось, шлем новый пост с фото
     if not edited:
-        try:
-            with open(resolved_path, "rb") as f:
-                msg = await context.bot.send_photo(
+        sent = False
+        if _image_ok(resolved_path):
+            try:
+                with open(resolved_path, "rb") as f:
+                    msg = await context.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=f,
+                        caption=caption,
+                        reply_markup=reply_markup,
+                        parse_mode="HTML",
+                    )
+                context.user_data["menu_msg_id"] = msg.message_id
+                context.user_data["current_photo"] = resolved_path
+                context.user_data["menu_is_photo"] = True
+                sent = True
+            except Exception as e:
+                logger.error(f"Failed to send post with photo: {e}")
+
+        if not sent:
+            try:
+                msg = await context.bot.send_message(
                     chat_id=chat_id,
-                    photo=f,
-                    caption=caption,
+                    text=caption,
                     reply_markup=reply_markup,
                     parse_mode="HTML",
                 )
                 context.user_data["menu_msg_id"] = msg.message_id
-                context.user_data["current_photo"] = resolved_path
-        except Exception as e:
-            logger.error(f"Failed to send post with photo: {e}")
+                context.user_data["current_photo"] = None
+                context.user_data["menu_is_photo"] = False
+            except Exception as e:
+                logger.error(f"Failed to send text menu: {e}")
 
 
 # ==============================================================================
@@ -629,70 +708,102 @@ def get_back_button(target: str = "nav_menu", text: str = "🔙 В главно�
 # ОБРАБОТЧИКИ: СТАРТ И КАПЧА (БЕЗ ФОТО, ОТДЕЛЬНЫМ ТЕКСТОВЫМ СООБЩЕНИЕМ)
 # ==============================================================================
 
+def _captcha_keyboard(options: List[int]) -> InlineKeyboardMarkup:
+    """Две строки по две кнопки. Одна длинная строка на телефоне часто не нажимается."""
+    buttons = [
+        InlineKeyboardButton(str(opt), callback_data=f"captcha_{opt}")
+        for opt in options
+    ]
+    return InlineKeyboardMarkup([buttons[:2], buttons[2:4]])
+
+
+async def _answer_query(query, text: str = "") -> None:
+    """Гасит спиннер кнопки ровно один раз. Повторный answer не роняет хендлер."""
+    try:
+        if text:
+            await query.answer(text, show_alert=False)
+        else:
+            await query.answer()
+    except Exception:
+        pass
+
+
 async def send_captcha_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     is_wrong: bool = False,
-):
+) -> bool:
     """
-    Отправляет или обновляет капчу ОДНИМ текстовым сообщением (без фото!).
-    Быстро, без зависаний и лишней нагрузки.
+    Отправляет или обновляет капчу одним текстовым сообщением (без фото).
+    Возвращает True, если сообщение удалось показать.
     """
     user = update.effective_user
+    if not user:
+        return False
     chat_id = update.effective_chat.id if update.effective_chat else user.id
 
     a = random.randint(1, 9)
     b = random.randint(1, 9)
     correct = a + b
     options = {correct}
+    guard = 0
+    while len(options) < 4 and guard < 40:
+        guard += 1
+        low = max(0, correct - 5)
+        high = correct + 5
+        fake = random.randint(low, high)
+        if fake != correct:
+            options.add(fake)
     while len(options) < 4:
-        fake = random.randint(max(1, correct - 4), correct + 4)
-        options.add(fake)
+        extra = (max(options) if options else correct) + 1
+        options.add(extra)
     opts_list = list(options)
     random.shuffle(opts_list)
 
-    context.user_data["captcha_correct"] = correct
+    context.user_data["captcha_correct"] = int(correct)
+    pending_captcha[user.id] = int(correct)
 
     if is_wrong:
         text = (
             "❌ <b>Неверный ответ!</b>\n\n"
-            "Пожалуйста, решите новый пример:\n\n"
-            f"👉 <b>Сколько будет {a} + {b} = ?</b>"
+            "Решите новый пример:\n\n"
+            f"👉 <b>Сколько будет {a} + {b}?</b>"
         )
     else:
         text = (
             "🤖 <b>Добро пожаловать в Pharmojelly Shop!</b>\n\n"
-            "Для защиты бота от спама и автоматических ботов, пожалуйста, решите простой пример:\n\n"
-            f"👉 <b>Сколько будет {a} + {b} = ?</b>"
+            "Чтобы открыть магазин, решите пример:\n\n"
+            f"👉 <b>Сколько будет {a} + {b}?</b>"
         )
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f" {opt} ", callback_data=f"captcha_{opt}") for opt in opts_list]
-    ])
+    kb = _captcha_keyboard(opts_list)
 
-    # 1. Если это callback (нажатие на кнопку) — редактируем текущее сообщение капчи
     query = update.callback_query
-    if query and query.message:
+    # Редактируем только текстовое сообщение капчи. Фото-пост так не меняется.
+    if query and query.message and not query.message.photo:
         try:
             await query.edit_message_text(text=text, reply_markup=kb, parse_mode="HTML")
-            return
+            context.user_data["captcha_msg_id"] = query.message.message_id
+            return True
+        except tg_error.BadRequest as e:
+            if "Message is not modified" in str(e):
+                context.user_data["captcha_msg_id"] = query.message.message_id
+                return True
+            logger.info(f"edit captcha failed: {e}")
         except Exception as e:
-            logger.debug(f"edit captcha failed: {e}")
-            # Если отредактировать не удалось — попробуем удалить старое и отправить новое
-            try:
-                await query.message.delete()
-            except Exception:
-                pass
+            logger.info(f"edit captcha failed: {e}")
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
 
-    # 2. Удаляем предыдущее сообщение капчи, если оно было сохранено
     prev_id = context.user_data.get("captcha_msg_id")
-    if prev_id:
+    if prev_id and (not query or not query.message or prev_id != query.message.message_id):
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=prev_id)
         except Exception:
             pass
 
-    # 3. Отправляем новое сообщение с капчей
     try:
         msg = await context.bot.send_message(
             chat_id=chat_id,
@@ -701,8 +812,10 @@ async def send_captcha_message(
             parse_mode="HTML",
         )
         context.user_data["captcha_msg_id"] = msg.message_id
+        return True
     except Exception as e:
         logger.error(f"Failed to send captcha text message: {e}")
+        return False
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -711,8 +824,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         return
 
-    # Защита от спама
-    if not check_anti_flood(user.id):
+    # /start не режем антифлудом: иначе повторный старт молча пропадает
+    # и кажется, что бот мёртвый.
+    token = context.bot.token
+    try:
+        u_data = await get_or_create_user(user.id, source_bot_token=token)
+    except Exception as e:
+        logger.exception("start user load failed: %s", e)
+        if update.effective_chat:
+            try:
+                await context.bot.send_message(update.effective_chat.id, "Не удалось открыть профиль. Нажмите /start ещё раз.")
+            except Exception:
+                pass
         return
 
     if update.message:
@@ -721,15 +844,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-    token = context.bot.token
-    u_data = await get_or_create_user(user.id, source_bot_token=token)
-
-    # Если капча еще не пройдена — шлем простое текстовое сообщение
     if not u_data.get("captcha_passed"):
-        await send_captcha_message(update, context)
+        ok = await send_captcha_message(update, context)
+        if not ok and update.effective_chat:
+            try:
+                await context.bot.send_message(
+                    update.effective_chat.id,
+                    "Не получилось показать капчу. Нажмите /start ещё раз.",
+                )
+            except Exception:
+                pass
         return
 
-    # Капча уже пройдена — показываем приветствие и главное меню с фото
     await show_main_menu(update, context)
 
 
@@ -740,72 +866,88 @@ async def captcha_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query or not user:
         return
 
-    # ⚠️ check_anti_flood уже вызван в callback_router.
-    # НЕ дублируем его здесь — иначе из-за миллисекундной задержки
-    # второй вызов сразу вернёт False и капча зависнет.
-
     try:
-        ans = query.data.split("_")[1]
+        ans = int(str(query.data).split("_", 1)[1])
     except Exception:
-        try:
-            await query.answer()
-        except Exception:
-            pass
-        return
-
-    correct = context.user_data.get("captcha_correct")
-
-    # Если капча в user_data потерялась (например, после рестарта бота)
-    if correct is None:
-        try:
-            await query.answer("⚠️ Капча устарела, генерирую новую...", show_alert=False)
-        except Exception:
-            pass
+        await _answer_query(query, "Капча устарела")
         await send_captcha_message(update, context, is_wrong=True)
         return
 
-    if str(correct) == ans:
-        # ✅ Правильный ответ — гасим спиннер с подтверждением
-        try:
-            await query.answer("✅ Капча успешно пройдена!", show_alert=False)
-        except Exception:
-            pass
+    try:
+        u_data = await get_or_create_user(user.id, source_bot_token=context.bot.token)
+    except Exception as e:
+        logger.exception("captcha user load failed: %s", e)
+        await _answer_query(query, "Ошибка базы, нажмите ещё раз")
+        return
 
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET captcha_passed = 1 WHERE tg_id = ?", (user.id,))
-            await db.commit()
-
-        # Удаляем текстовое сообщение капчи
+    # Двойной клик по верному ответу не должен заново рисовать капчу
+    if u_data.get("captcha_passed"):
+        await _answer_query(query)
+        context.user_data.pop("captcha_correct", None)
+        pending_captcha.pop(user.id, None)
         try:
-            if query.message:
+            if query.message and not query.message.photo:
                 await query.message.delete()
         except Exception:
             pass
+        await show_main_menu(update, context, force_new=True)
+        return
 
-        context.user_data.pop("captcha_msg_id", None)
-        context.user_data["menu_msg_id"] = None
-        context.user_data["current_photo"] = None
+    correct = context.user_data.get("captcha_correct")
+    if correct is None:
+        correct = pending_captcha.get(user.id)
 
-        # Открываем полный функционал бота с баннером и клавиатурой
-        await show_main_menu(update, context)
-    else:
-        # ❌ Неверный ответ — гасим спиннер, показываем новую капчу
-        try:
-            await query.answer("❌ Неверно! Попробуйте еще раз.", show_alert=False)
-        except Exception:
-            pass
-
+    if correct is None:
+        await _answer_query(query, "Капча устарела, вот новая")
         await send_captcha_message(update, context, is_wrong=True)
+        return
+
+    if int(correct) != ans:
+        await _answer_query(query, "Неверно, попробуйте ещё раз")
+        await send_captcha_message(update, context, is_wrong=True)
+        return
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("PRAGMA busy_timeout=5000;")
+            await db.execute("UPDATE users SET captcha_passed = 1 WHERE tg_id = ?", (user.id,))
+            await db.commit()
+    except Exception as e:
+        logger.exception("captcha save failed: %s", e)
+        await _answer_query(query, "Не удалось сохранить, нажмите ответ ещё раз")
+        return
+
+    await _answer_query(query, "Капча пройдена")
+    context.user_data.pop("captcha_correct", None)
+    pending_captcha.pop(user.id, None)
+    context.user_data["menu_msg_id"] = None
+    context.user_data["current_photo"] = None
+
+    try:
+        if query.message:
+            await query.message.delete()
+    except Exception:
+        pass
+    context.user_data.pop("captcha_msg_id", None)
+
+    # Новое меню, без попытки превратить удалённый текст капчи в фото
+    await show_main_menu(update, context, force_new=True)
 
 
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_main_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    force_new: bool = False,
+):
     """Отображение главного меню с фото banner."""
     user = update.effective_user
     is_adm = user.id in ADMIN_IDS if user else False
     banner_photo = await get_config("banner_main", FILE_BANNER_MAIN)
     greeting = await get_config("greeting_text", DEFAULT_GREETING)
     kb = get_main_keyboard(is_admin=is_adm)
-    await render_post(update, context, banner_photo, greeting, kb)
+    await render_post(update, context, banner_photo, greeting, kb, force_new=force_new)
+
+# ==============================================================================
 
 # ==============================================================================
 # ОБРАБОТЧИКИ: ПРОФИЛЬ И ПОПОЛНЕНИЕ КОШЕЛЬКА
@@ -1244,7 +1386,12 @@ async def show_my_bots_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Главный экран админ-панели."""
     user = update.effective_user
-    if user.id not in ADMIN_IDS:
+    if not user or user.id not in ADMIN_IDS:
+        if update.callback_query:
+            try:
+                await update.callback_query.answer("Нет доступа", show_alert=True)
+            except Exception:
+                pass
         return
 
     banner_photo = await get_config("banner_main", FILE_BANNER_MAIN)
@@ -1284,21 +1431,24 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query or not user:
         return
 
+    data = query.data or ""
+
+    # Капча обрабатывается ДО антифлуда.
+    # Иначе первый клик сразу после /start съедается, кнопка «умирает»,
+    # а в логе нет нормальной ошибки.
+    if data.startswith("captcha_"):
+        await captcha_callback(update, context)
+        return
+
     # Защита от флуда
     if not check_anti_flood(user.id):
         try:
-            await query.answer("⚠️ Не кликайте слишком быстро!", show_alert=False)
+            await query.answer("Не кликайте слишком быстро", show_alert=False)
         except Exception:
             pass
         return
 
-    data = query.data
     logger.info(f"Callback from user {user.id}: {data}")
-
-    # 1. Капча
-    if data.startswith("captcha_"):
-        await captcha_callback(update, context)
-        return
 
     # Защита: пока капча не пройдена, никакой другой функционал не доступен
     u_data = await get_or_create_user(user.id, source_bot_token=context.bot.token)
@@ -1514,23 +1664,27 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data.startswith("order_reject_"):
             oid = int(data.split("_")[2])
+            price = 0.0
             async with aiosqlite.connect(DB_PATH) as db:
                 cur = await db.execute("SELECT user_tg_id, price FROM orders WHERE id = ?", (oid,))
                 r = await cur.fetchone()
-                if r:
-                    buyer_id, price = r
-                    await db.execute("UPDATE orders SET status = 'declined' WHERE id = ?", (oid,))
-                    # Возврат средств покупателю
-                    await db.execute("UPDATE users SET balance = balance + ? WHERE tg_id = ?", (price, buyer_id))
-                    await db.commit()
-                    # Уведомление покупателю строго по ТЗ
+                if not r:
                     try:
-                        await context.bot.send_message(
-                            buyer_id,
-                            "Ваш заказ отклонен админом. Деньги отправлены на ваш счет",
-                        )
-                    except Exception as e:
-                        logger.warning(f"Error messaging buyer: {e}")
+                        await query.answer("Заказ не найден", show_alert=True)
+                    except Exception:
+                        pass
+                    return
+                buyer_id, price = r
+                await db.execute("UPDATE orders SET status = 'declined' WHERE id = ?", (oid,))
+                await db.execute("UPDATE users SET balance = balance + ? WHERE tg_id = ?", (price, buyer_id))
+                await db.commit()
+            try:
+                await context.bot.send_message(
+                    buyer_id,
+                    "Ваш заказ отклонен админом. Деньги отправлены на ваш счет",
+                )
+            except Exception as e:
+                logger.warning(f"Error messaging buyer: {e}")
             try:
                 await query.edit_message_text(
                     f"❌ <b>Заказ #{oid} отклонен.</b>\nСумма {price:g} $ возвращена на счет покупателя.",
@@ -2746,20 +2900,42 @@ async def cleanup_old_tickets_job():
 # ФАБРИКА БОТОВ И МУЛЬТИБОТ-АРХИТЕКТУРА
 # ==============================================================================
 
-def build_application(token: str) -> Application:
-    """Создает и настраивает экземпляр Application со всеми хендлерами."""
-    request_kwargs = {
+def _make_request() -> HTTPXRequest:
+    """Отдельный HTTP-клиент. Один и тот же объект на polling и send вешает бота."""
+    kwargs = {
         "connect_timeout": 30.0,
         "read_timeout": 30.0,
         "write_timeout": 30.0,
         "pool_timeout": 30.0,
         "connection_pool_size": 8,
     }
-    if PROXY_URL:
-        request_kwargs["proxy_url"] = PROXY_URL
+    if not PROXY_URL:
+        return HTTPXRequest(**kwargs)
+    # PTB 20: proxy_url, PTB 21+: proxy
+    try:
+        return HTTPXRequest(proxy=PROXY_URL, **kwargs)
+    except TypeError:
+        return HTTPXRequest(proxy_url=PROXY_URL, **kwargs)
 
-    req = HTTPXRequest(**request_kwargs)
-    builder = Application.builder().token(token).request(req).get_updates_request(req)
+
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Любая ошибка хендлера больше не оставляет вечный спиннер на кнопке."""
+    logger.exception("Handler error: %s", context.error)
+    if isinstance(update, Update) and update.callback_query:
+        try:
+            await update.callback_query.answer("Ошибка, попробуйте ещё раз", show_alert=False)
+        except Exception:
+            pass
+
+
+def build_application(token: str) -> Application:
+    """Создает и настраивает экземпляр Application со всеми хендлерами."""
+    builder = (
+        Application.builder()
+        .token(token)
+        .request(_make_request())
+        .get_updates_request(_make_request())
+    )
 
     if BASE_URL:
         url = BASE_URL.rstrip("/")
@@ -2769,16 +2945,12 @@ def build_application(token: str) -> Application:
 
     app = builder.build()
 
-    # Регистрация команд
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("admin", admin_home))
-
-    # Регистрация Callback кнопок
     app.add_handler(CallbackQueryHandler(callback_router))
-
-    # Регистрация текстовых и фото сообщений
     app.add_handler(MessageHandler(filters.PHOTO, photo_message_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler))
+    app.add_error_handler(global_error_handler)
 
     return app
 
@@ -2791,7 +2963,10 @@ async def start_clone_bot(token: str):
         app = build_application(token)
         await app.initialize()
         await app.start()
-        await app.updater.start_polling(drop_pending_updates=True)
+        await app.updater.start_polling(
+            drop_pending_updates=False,
+            allowed_updates=["message", "callback_query"],
+        )
         running_applications[token] = app
         bot_user = await app.bot.get_me()
         logger.info(f"Clone bot @{bot_user.username} started successfully.")
@@ -2807,6 +2982,12 @@ async def main_async():
     """Главная асинхронная функция запуска."""
     global main_app_instance
 
+    if not BOT_TOKEN:
+        print("Нет BOT_TOKEN. Создайте файл .env рядом со скриптом и впишите строку:")
+        print("BOT_TOKEN=123456789:AA...")
+        print("Старый токен из кода лучше перевыпустить в @BotFather: он уже был в исходнике.")
+        sys.exit(1)
+
     logger.info("Initializing Pharmojelly Bot Database...")
     await init_db()
 
@@ -2821,25 +3002,30 @@ async def main_async():
     try:
         await main_app.initialize()
         await main_app.start()
-        await main_app.updater.start_polling(drop_pending_updates=True)
+        await main_app.updater.start_polling(
+            drop_pending_updates=False,
+            allowed_updates=["message", "callback_query"],
+        )
         running_applications[BOT_TOKEN] = main_app
         main_info = await main_app.bot.get_me()
         logger.info(f"Main bot @{main_info.username} is RUNNING!")
     except Exception as exc:
         logger.error(f"Failed to connect to Telegram API: {exc}")
+        name = type(exc).__name__
+        text = str(exc)
         print("\n" + "=" * 65)
-        print("❌ ОШИБКА ПОДКЛЮЧЕНИЯ К TELEGRAM BOT API!")
-        print("   Не удается соединиться с https://api.telegram.org (таймаут / сброс).")
-        print("   Причина: Блокировка доступа к серверам Telegram вашим провайдером.")
-        print("-" * 65)
-        print("💡 КАК ЗАПУСТИТЬ БОТА (выберите один из вариантов):")
-        print("   1. Включите любой VPN (например, PlanetVPN, Amnezia, V2Ray, Clash, Outline).")
-        print("   2. Либо запустите zapret (в папке zapret-discord-youtube на рабочем столе")
-        print("      запустите general.bat от имени Администратора).")
-        print("   3. Либо укажите рабочий прокси в файле .env (создайте рядом с 3jly.py):")
-        print("      PROXY_URL=http://127.0.0.1:10808 (или socks5://...)")
-        print("   4. Либо укажите адрес зеркала / reverse proxy Telegram в файле .env:")
-        print("      BASE_URL=https://<ваше-зеркало>/bot")
+        if "Unauthorized" in name or "Unauthorized" in text or "Rejected" in name:
+            print("НЕВЕРНЫЙ BOT_TOKEN.")
+            print("Откройте @BotFather, сделайте /revoke и впишите новый токен в .env:")
+            print("BOT_TOKEN=123456789:AA...")
+        elif any(s in name for s in ("TimedOut", "NetworkError", "ConnectError")) or "timeout" in text.lower() or "Connect" in text:
+            print("НЕТ СВЯЗИ С api.telegram.org (таймаут или блок провайдера).")
+            print("1. Включите VPN.")
+            print("2. Либо пропишите в .env прокси: PROXY_URL=socks5://127.0.0.1:10808")
+            print("3. Либо зеркало: BASE_URL=https://<зеркало>/bot")
+        else:
+            print("БОТ НЕ СТАРТАНУЛ.")
+            print(f"{name}: {text}")
         print("=" * 65 + "\n")
         sys.exit(1)
 
@@ -2873,6 +3059,8 @@ async def main_async():
 
 
 def main():
+    if sys.platform.startswith("win"):
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     try:
         asyncio.run(main_async())
     except KeyboardInterrupt:
