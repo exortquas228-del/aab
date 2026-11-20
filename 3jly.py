@@ -733,23 +733,54 @@ async def captcha_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query or not user:
         return
 
-    # МГНОВЕННО отвечаем на callback_query, чтобы спиннер на кнопке сразу исчез
-    try:
-        await query.answer()
-    except Exception:
-        pass
-
-    if not check_anti_flood(user.id):
-        return
+    # ⚠️ Анти-флуд уже проверен в callback_router.
+    # НЕ дублируем check_anti_flood здесь — иначе из-за миллисекундной задержки
+    # второй вызов сразу вернёт False и обработка капчи зависнет.
 
     try:
         ans = query.data.split("_")[1]
     except Exception:
+        try:
+            await query.answer()
+        except Exception:
+            pass
         return
 
     correct = context.user_data.get("captcha_correct")
 
     if correct is not None and str(correct) == ans:
+        # ✅ Правильный ответ — гасим спиннер и показываем подтверждение
+        try:
+            await query.answer("✅ Капча успешно пройдена!", show_alert=False)
+        except Exception:
+            pass
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET captcha_passed = 1 WHERE tg_id = ?", (user.id,))
+            await db.commit()
+
+        # Удаляем текстовое сообщение капчи
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+
+        context.user_data.pop("captcha_msg_id", None)
+        context.user_data["menu_msg_id"] = None
+        context.user_data["current_photo"] = None
+
+        # Открываем полный функционал бота с баннером и клавиатурой
+        await show_main_menu(update, context)
+    else:
+        # ❌ Неверный ответ — гасим спиннер и показываем новую капчу
+        try:
+            await query.answer("❌ Неверно! Попробуйте еще раз.", show_alert=False)
+        except Exception:
+            pass
+
+        # send_captcha_message сам отредактирует текущее сообщение
+        # и покажет новый пример с текстом "❌ Неверный ответ!"
+        await send_captcha_message(update, context, is_wrong=True)
         # Успешное прохождение капчи
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("UPDATE users SET captcha_passed = 1 WHERE tg_id = ?", (user.id,))
