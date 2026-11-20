@@ -490,10 +490,12 @@ async def render_post(
     """
     resolved_path = resolve_photo_path(photo_name_or_path)
     user_id = update.effective_user.id if update.effective_user else 0
-    chat_id = update.effective_chat.id if update.effective_chat else 0
+    chat_id = update.effective_chat.id if update.effective_chat else user_id
 
     if not keep_state:
         context.user_data.pop("state", None)
+
+    edited = False
 
     # 1. Если клик по кнопке (CallbackQuery)
     if update.callback_query:
@@ -504,66 +506,12 @@ async def render_post(
             pass
 
         current_photo = context.user_data.get("current_photo")
-        edited = False
 
-        # Если фото то же самое — просто меняем подпись (это мгновенно и без задержки)
-        if current_photo == resolved_path:
-            try:
-                await query.edit_message_caption(
-                    caption=caption,
-                    reply_markup=reply_markup,
-                    parse_mode="HTML",
-                )
-                edited = True
-            except tg_error.BadRequest as e:
-                if "Message is not modified" in str(e):
-                    edited = True
-                else:
-                    edited = False
-            except Exception:
-                edited = False
-
-        # Если фото изменилось или edit_caption не прошел — редактируем медиа
-        if not edited:
-            try:
-                with open(resolved_path, "rb") as f:
-                    await query.edit_message_media(
-                        media=InputMediaPhoto(media=f, caption=caption, parse_mode="HTML"),
-                        reply_markup=reply_markup,
-                    )
-                context.user_data["current_photo"] = resolved_path
-                edited = True
-            except tg_error.BadRequest as e:
-                if "Message is not modified" in str(e):
-                    edited = True
-                else:
-                    edited = False
-            except Exception as e:
-                logger.warning(f"edit_message_media error: {e}")
-                edited = False
-
-        if edited and query.message:
-            context.user_data["menu_msg_id"] = query.message.message_id
-            return
-
-    # 2. Если пользователь прислал текстовое сообщение или файл
-    if update.message:
-        # Пытаемся удалить сообщение пользователя для идеальной чистоты чата
-        try:
-            await update.message.delete()
-        except Exception:
-            pass
-
-        menu_msg_id = context.user_data.get("menu_msg_id")
-        current_photo = context.user_data.get("current_photo")
-        edited = False
-
-        if menu_msg_id:
+        if query.message:
+            # Если фото то же самое — просто меняем подпись (это мгновенно и без задержки)
             if current_photo == resolved_path:
                 try:
-                    await context.bot.edit_message_caption(
-                        chat_id=chat_id,
-                        message_id=menu_msg_id,
+                    await query.edit_message_caption(
                         caption=caption,
                         reply_markup=reply_markup,
                         parse_mode="HTML",
@@ -575,12 +523,11 @@ async def render_post(
                 except Exception:
                     edited = False
 
+            # Если фото изменилось или edit_caption не прошел — пробуем редактировать медиа
             if not edited:
                 try:
                     with open(resolved_path, "rb") as f:
-                        await context.bot.edit_message_media(
-                            chat_id=chat_id,
-                            message_id=menu_msg_id,
+                        await query.edit_message_media(
                             media=InputMediaPhoto(media=f, caption=caption, parse_mode="HTML"),
                             reply_markup=reply_markup,
                         )
@@ -589,24 +536,82 @@ async def render_post(
                 except tg_error.BadRequest as e:
                     if "Message is not modified" in str(e):
                         edited = True
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"edit_message_media error: {e}")
                     edited = False
 
-        # Если отредактировать не удалось (например, первое сообщение), шлем новый пост с фото
+        if edited and query.message:
+            context.user_data["menu_msg_id"] = query.message.message_id
+            return
+
+        # Если не удалось отредактировать сообщение (например, это было текстовое сообщение капчи или удаленное сообщение),
+        # пытаемся удалить старое сообщение query
+        try:
+            if query.message:
+                await query.message.delete()
+        except Exception:
+            pass
+
+    # 2. Если пользователь прислал текстовое сообщение или файл
+    elif update.message:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+    # 3. Попытка отредактировать сохраненный menu_msg_id
+    menu_msg_id = context.user_data.get("menu_msg_id")
+    current_photo = context.user_data.get("current_photo")
+
+    if menu_msg_id:
+        if current_photo == resolved_path:
+            try:
+                await context.bot.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=menu_msg_id,
+                    caption=caption,
+                    reply_markup=reply_markup,
+                    parse_mode="HTML",
+                )
+                edited = True
+            except tg_error.BadRequest as e:
+                if "Message is not modified" in str(e):
+                    edited = True
+            except Exception:
+                edited = False
+
         if not edited:
             try:
                 with open(resolved_path, "rb") as f:
-                    msg = await context.bot.send_photo(
+                    await context.bot.edit_message_media(
                         chat_id=chat_id,
-                        photo=f,
-                        caption=caption,
+                        message_id=menu_msg_id,
+                        media=InputMediaPhoto(media=f, caption=caption, parse_mode="HTML"),
                         reply_markup=reply_markup,
-                        parse_mode="HTML",
                     )
-                    context.user_data["menu_msg_id"] = msg.message_id
-                    context.user_data["current_photo"] = resolved_path
-            except Exception as e:
-                logger.error(f"Failed to send post with photo: {e}")
+                context.user_data["current_photo"] = resolved_path
+                edited = True
+            except tg_error.BadRequest as e:
+                if "Message is not modified" in str(e):
+                    edited = True
+            except Exception:
+                edited = False
+
+    # 4. Если отредактировать не удалось, шлем новый пост с фото
+    if not edited:
+        try:
+            with open(resolved_path, "rb") as f:
+                msg = await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=f,
+                    caption=caption,
+                    reply_markup=reply_markup,
+                    parse_mode="HTML",
+                )
+                context.user_data["menu_msg_id"] = msg.message_id
+                context.user_data["current_photo"] = resolved_path
+        except Exception as e:
+            logger.error(f"Failed to send post with photo: {e}")
 
 
 # ==============================================================================
@@ -634,8 +639,77 @@ def get_back_button(target: str = "nav_menu", text: str = "🔙 В главно�
 
 
 # ==============================================================================
-# ОБРАБОТЧИКИ: СТАРТ И КАПЧА
+# ОБРАБОТЧИКИ: СТАРТ И КАПЧА (БЕЗ ФОТО, ОТДЕЛЬНЫМ ТЕКСТОВЫМ СООБЩЕНИЕМ)
 # ==============================================================================
+
+async def send_captcha_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    is_wrong: bool = False,
+):
+    """
+    Отправляет или обновляет капчу ОДНИМ текстовым сообщением (без фото!).
+    Быстро, без зависаний и лишней нагрузки.
+    """
+    user = update.effective_user
+    chat_id = update.effective_chat.id if update.effective_chat else user.id
+
+    a = random.randint(1, 9)
+    b = random.randint(1, 9)
+    correct = a + b
+    options = {correct}
+    while len(options) < 4:
+        fake = random.randint(max(1, correct - 4), correct + 4)
+        options.add(fake)
+    opts_list = list(options)
+    random.shuffle(opts_list)
+
+    context.user_data["captcha_correct"] = correct
+
+    if is_wrong:
+        text = (
+            "❌ <b>Неверный ответ!</b>\n\n"
+            "Пожалуйста, решите новый пример:\n\n"
+            f"👉 <b>Сколько будет {a} + {b} = ?</b>"
+        )
+    else:
+        text = (
+            "🤖 <b>Добро пожаловать в Pharmojelly Shop!</b>\n\n"
+            "Для защиты бота от спама и автоматических ботов, пожалуйста, решите простой пример:\n\n"
+            f"👉 <b>Сколько будет {a} + {b} = ?</b>"
+        )
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f" {opt} ", callback_data=f"captcha_{opt}") for opt in opts_list]
+    ])
+
+    query = update.callback_query
+    if query and query.message:
+        try:
+            await query.edit_message_text(text=text, reply_markup=kb, parse_mode="HTML")
+            return
+        except Exception:
+            pass
+
+    # Удаляем предыдущее сообщение капчи, если оно было
+    prev_id = context.user_data.get("captcha_msg_id")
+    if prev_id:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=prev_id)
+        except Exception:
+            pass
+
+    try:
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+        context.user_data["captcha_msg_id"] = msg.message_id
+    except Exception as e:
+        logger.error(f"Failed to send captcha text message: {e}")
+
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /start: проверка капчи и выдача меню."""
@@ -647,36 +721,21 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_anti_flood(user.id):
         return
 
+    if update.message:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
     token = context.bot.token
     u_data = await get_or_create_user(user.id, source_bot_token=token)
 
-    # Если капча еще не пройдена
-    if not u_data["captcha_passed"]:
-        a = random.randint(1, 9)
-        b = random.randint(1, 9)
-        correct = a + b
-        options = {correct}
-        while len(options) < 4:
-            fake = random.randint(max(1, correct - 4), correct + 4)
-            options.add(fake)
-        opts_list = list(options)
-        random.shuffle(opts_list)
-
-        context.user_data["captcha_correct"] = correct
-        banner_photo = await get_config("banner_main", FILE_BANNER_MAIN)
-
-        caption = (
-            "🤖 <b>Добро пожаловать!</b>\n\n"
-            "Для защиты бота от спама и блокировок, пожалуйста, решите простой пример:\n\n"
-            f"👉 <b>Сколько будет {a} + {b} ?</b>"
-        )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(str(opt), callback_data=f"captcha_{opt}") for opt in opts_list]
-        ])
-        await render_post(update, context, banner_photo, caption, kb, keep_state=True)
+    # Если капча еще не пройдена — шлем простое текстовое сообщение
+    if not u_data.get("captcha_passed"):
+        await send_captcha_message(update, context)
         return
 
-    # Капча пройдена — показываем приветствие и главное меню
+    # Капча уже пройдена — показываем приветствие и главное меню с фото
     await show_main_menu(update, context)
 
 
@@ -687,54 +746,58 @@ async def captcha_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query or not user:
         return
 
+    # МГНОВЕННО отвечаем на callback_query, чтобы спиннер на кнопке сразу исчез
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
     if not check_anti_flood(user.id):
         return
 
-    ans = query.data.split("_")[1]
+    try:
+        ans = query.data.split("_")[1]
+    except Exception:
+        return
+
     correct = context.user_data.get("captcha_correct")
 
     if correct is not None and str(correct) == ans:
+        # Успешное прохождение капчи
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("UPDATE users SET captcha_passed = 1 WHERE tg_id = ?", (user.id,))
             await db.commit()
+
         try:
             await query.answer("✅ Капча успешно пройдена!", show_alert=False)
         except Exception:
             pass
+
+        # Удаляем текстовое сообщение капчи
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+
+        context.user_data.pop("captcha_msg_id", None)
+        context.user_data["menu_msg_id"] = None
+        context.user_data["current_photo"] = None
+
+        # Открываем полный функционал бота с баннером и клавиатурой
         await show_main_menu(update, context)
     else:
+        # Неверный ответ — моментальное всплывающее окно и генерация нового примера
         try:
             await query.answer("❌ Неверно! Попробуйте еще раз.", show_alert=True)
         except Exception:
             pass
-        # Сгенерируем новый пример
-        a = random.randint(1, 9)
-        b = random.randint(1, 9)
-        correct = a + b
-        options = {correct}
-        while len(options) < 4:
-            fake = random.randint(max(1, correct - 4), correct + 4)
-            options.add(fake)
-        opts_list = list(options)
-        random.shuffle(opts_list)
-
-        context.user_data["captcha_correct"] = correct
-        banner_photo = await get_config("banner_main", FILE_BANNER_MAIN)
-        caption = (
-            "🤖 <b>Неверный ответ!</b>\n\n"
-            "Попробуйте решить этот пример:\n\n"
-            f"👉 <b>Сколько будет {a} + {b} ?</b>"
-        )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(str(opt), callback_data=f"captcha_{opt}") for opt in opts_list]
-        ])
-        await render_post(update, context, banner_photo, caption, kb, keep_state=True)
+        await send_captcha_message(update, context, is_wrong=True)
 
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отображение главного меню с фото banner."""
     user = update.effective_user
-    is_adm = user.id in ADMIN_IDS
+    is_adm = user.id in ADMIN_IDS if user else False
     banner_photo = await get_config("banner_main", FILE_BANNER_MAIN)
     greeting = await get_config("greeting_text", DEFAULT_GREETING)
     kb = get_main_keyboard(is_admin=is_adm)
@@ -1232,6 +1295,16 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 1. Капча
     if data.startswith("captcha_"):
         await captcha_callback(update, context)
+        return
+
+    # Защита: пока капча не пройдена, никакой другой функционал не доступен
+    u_data = await get_or_create_user(user.id, source_bot_token=context.bot.token)
+    if not u_data.get("captcha_passed"):
+        try:
+            await query.answer("⚠️ Сначала решите пример для доступа к боту!", show_alert=True)
+        except Exception:
+            pass
+        await send_captcha_message(update, context)
         return
 
     # 2. Главная навигация
@@ -1885,6 +1958,17 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if not user:
         return
 
+    # Защита капчей: пока капча не пройдена, текстовый ввод недоступен
+    u_data = await get_or_create_user(user.id, source_bot_token=context.bot.token)
+    if not u_data.get("captcha_passed"):
+        if update.message:
+            try:
+                await update.message.delete()
+            except Exception:
+                pass
+        await send_captcha_message(update, context)
+        return
+
     text = update.message.text.strip()
     state = context.user_data.get("state")
     banner_photo = await get_config("banner_main", FILE_BANNER_MAIN)
@@ -2426,6 +2510,16 @@ async def photo_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     """
     user = update.effective_user
     if not user or not update.message.photo:
+        return
+
+    # Защита капчей: пока капча не пройдена, отправка фото недоступна
+    u_data = await get_or_create_user(user.id, source_bot_token=context.bot.token)
+    if not u_data.get("captcha_passed"):
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        await send_captcha_message(update, context)
         return
 
     photo_file = update.message.photo[-1]
